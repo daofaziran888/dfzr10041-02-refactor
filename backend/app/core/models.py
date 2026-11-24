@@ -76,6 +76,8 @@ class ParseRule:
     multiline: bool = False
     priority: int = 0
     state: str = "草稿"
+    # 独立的规则版本字段：登记中心完成编译后回写，绑定这一版正则和字段名。
+    rule_version: str = ""
     _compiled_re: re.Pattern[str] | None = field(default=None, repr=False, compare=False)
 
     def compile(self) -> re.Pattern[str]:
@@ -111,6 +113,10 @@ class LogEntry:
     event_time: datetime | None = None
     host: str = ""
     checksum: str = field(default="")
+    # 解析入口回写的规则版本：分类入口据此校验，正式批次只读该版本的字段。
+    rule_version: str = ""
+    # 受控试跑标记：试跑条目永不进入正式事件分类。
+    is_trial: bool = False
 
     def compute_checksum(self) -> str:
         """基于原始行和解析字段计算内容校验哈希。"""
@@ -226,6 +232,8 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    # 分类入口记录的关联规则版本：事件实际使用的解析字段可回溯到该版本。
+    rule_version: str = ""
 
 
 @dataclass

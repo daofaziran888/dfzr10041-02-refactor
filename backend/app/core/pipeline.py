@@ -16,6 +16,12 @@ from app.core.models import (
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
     QualityReport,
 )
+from app.core.rule_version import (
+    BatchEvidence, RuleVersionConfirmationPending, RuleVersionError,
+    RuleVersionEvidenceMismatch, RuleVersionInvalid, RuleVersionRegistry,
+    TrialCapture, TrialCaptureItem, VERSION_CONFIRMED, VERSION_TRIAL,
+    raw_line_checksum,
+)
 
 # ---------- 预置日志来源配置 ----------
 
@@ -135,6 +141,10 @@ class IngestPipeline:
         self._checkpoint_store: dict[str, BatchCheckpoint] = {}
         self._event_store: dict[str, list[EventRecord]] = {}
         self._fingerprint_seen: set[str] = set()
+        # 规则编译职责收拢到版本登记中心：解析入口和分类入口共用同一份版本记录。
+        self.rule_registry = RuleVersionRegistry()
+        # 每个正式批次实际读到的原日志证据，支持回溯到各批原日志。
+        self._batch_evidence: dict[str, BatchEvidence] = {}
 
     # ---------- 数据流 1: log_source → parser_rule → ingest_job → event_store ----------
 
@@ -155,15 +165,38 @@ class IngestPipeline:
             ))
         return entries
 
-    def apply_parse_rules(self, entries: list[LogEntry], rule: ParseRule) -> list[LogEntry]:
-        """用解析规则从日志条目中提取字段。"""
+    def apply_parse_rules(
+        self, entries: list[LogEntry], rule: ParseRule, job_id: str = "default"
+    ) -> list[LogEntry]:
+        """用解析规则从日志条目中提取字段。
+
+        编译职责已收拢到规则版本登记中心：正式批次只使用「已确认」版本，
+        每个成功批只用经过校验的一版正则和字段名，并在条目上回写规则版本字段，
+        同时保存本批实际读到的原日志校验依据。
+        """
+        compilation = self.rule_registry.bootstrap_confirmed(rule)
+        version_id = compilation.version_id
+        evidence_items: list[dict[str, Any]] = []
         for entry in entries:
             if entry.parse_status == ParseResultStatus.FORMAT_MISMATCH:
                 continue
-            status, fields = rule.parse(entry.raw_line)
+            status, fields = compilation.parse_line(entry.raw_line)
             entry.parse_status = status
             entry.parsed_fields = fields or {}
+            entry.rule_version = version_id
+            entry.is_trial = False
             entry.checksum = entry.compute_checksum()
+            evidence_items.append({
+                "line_number": entry.line_number,
+                "raw_line": entry.raw_line,
+                "raw_checksum": raw_line_checksum(entry.raw_line),
+                "entry_checksum": entry.checksum,
+                "parse_status": status.value,
+                "field_names": list(compilation.field_names),
+            })
+        self._batch_evidence[f"{job_id}:{version_id}"] = BatchEvidence(
+            job_id=job_id, version_id=version_id, items=evidence_items
+        )
         return entries
 
     def run_ingest_job(self, entries: list[LogEntry], job: IngestJob) -> list[LogEntry]:
@@ -186,13 +219,31 @@ class IngestPipeline:
 
         数据流入口：event_store ← 解析后的 LogEntry
         分类依据：日志级别（app log → error/access）或来源标识
+        版本约束：
+        - 受控试跑条目不进入正式分类；
+        - 条目必须带规则版本字段，且该版本仍是规则的已确认版本，
+          分类实际读到的字段数据与解析入口的编译版本严格一致。
         """
         records: list[EventRecord] = []
         host_counter: dict[str, int] = {}
         for entry in entries:
             if entry.parse_status != ParseResultStatus.OK or not entry.parsed_fields:
                 continue
-            event_type = self._classify_entry(entry)
+            if entry.is_trial:
+                continue
+            version_id = entry.rule_version
+            if not version_id:
+                raise RuleVersionError(
+                    f"第 {entry.line_number} 行缺少规则版本字段，"
+                    "未经版本登记的解析结果不能进入正式分类"
+                )
+            compilation = self.rule_registry.get_compilation(version_id)
+            if compilation is None or compilation.state != VERSION_CONFIRMED:
+                raise RuleVersionConfirmationPending(
+                    f"规则版本 {version_id} 未确认或已阻断，"
+                    "版本登记确认未送回，正式分类进程中断"
+                )
+            event_type = self._classify_entry(entry, compilation)
             host = entry.parsed_fields.get("client_ip") or entry.parsed_fields.get("hostname") or "unknown"
             host_counter[host] = host_counter.get(host, 0) + 1
             partition = f"{datetime.now():%Y%m%d}"
@@ -207,6 +258,7 @@ class IngestPipeline:
                 source_host=host,
                 store_partition=partition,
                 index_state="已写入",
+                rule_version=version_id,
             )
             records.append(record)
         return records
@@ -411,16 +463,123 @@ class IngestPipeline:
 
     # ---------- 内部辅助方法 ----------
 
-    def _classify_entry(self, entry: LogEntry) -> EventTypeDef:
-        """根据解析字段对日志条目做事件分类。"""
+    def _classify_entry(self, entry: LogEntry, compilation) -> EventTypeDef:
+        """根据解析字段对日志条目做事件分类。
+
+        只按已确认版本登记的字段名读字段：旧版 message / 新版 body 的捕获结果
+        各自保存在自己的版本记录里，分类不跨版本借用字段名。
+        """
         fields = entry.parsed_fields or {}
-        level = fields.get("level", "").upper()
-        if level == "ERROR":
+        level_field = "level" if "level" in compilation.field_names else None
+        level = fields.get(level_field, "").upper() if level_field else ""
+        if "ERROR" in level:
             return PRESET_EVENT_TYPES.get("error", PRESET_EVENT_TYPES["access"])
-        action = fields.get("action", "").upper()
+        action = fields.get("action", "").upper() if "action" in compilation.field_names else ""
         if action in ("LOGIN", "LOGOUT", "AUTH", "AUTHENTICATE"):
             return PRESET_EVENT_TYPES.get("auth", PRESET_EVENT_TYPES["access"])
         return PRESET_EVENT_TYPES.get("access", PRESET_EVENT_TYPES["access"])
+
+    # ---------- 规则版本：受控试跑 / 中断恢复 / 认领 ----------
+
+    def enable_new_rule(self, rule: ParseRule):
+        """负责人启用新版规则：非法正则在此阻断，旧规则与待完成作业保持可用。"""
+        return self.rule_registry.enable_version(rule)
+
+    def run_controlled_trial(
+        self, source: LogSourceConfig, rule: ParseRule, raw_lines: list[str]
+    ) -> TrialCapture:
+        """受控试跑：用候选版本解析原行，结果只留痕不入正式库。
+
+        非法规则也可在此判定（编译失败时登记为阻断版本并返回失败留痕），
+        与「启用处阻断」是两条等价的拦截路径。
+        """
+        compilation = self.rule_registry.register_version(rule)
+        entries = self.parse_raw_lines(source, raw_lines)
+        items: list[TrialCaptureItem] = []
+        for entry in entries:
+            if entry.parse_status == ParseResultStatus.FORMAT_MISMATCH:
+                items.append(TrialCaptureItem(
+                    line_number=entry.line_number, raw_line=entry.raw_line,
+                    raw_checksum=raw_line_checksum(entry.raw_line),
+                    parse_status=ParseResultStatus.FORMAT_MISMATCH, fields=None,
+                    field_names=list(compilation.field_names),
+                ))
+                continue
+            status, fields = compilation.parse_line(entry.raw_line)
+            items.append(TrialCaptureItem(
+                line_number=entry.line_number, raw_line=entry.raw_line,
+                raw_checksum=raw_line_checksum(entry.raw_line),
+                parse_status=status, fields=fields,
+                field_names=list(compilation.field_names),
+            ))
+        capture = TrialCapture(
+            version_id=compilation.version_id, rule_id=rule.rule_id,
+            valid=compilation.valid, items=items,
+        )
+        self.rule_registry.save_trial(capture)
+        rule.rule_version = compilation.version_id
+        return capture
+
+    def deliver_trial_to_classifier(self, version_id: str) -> list[dict[str, Any]]:
+        """把试跑字段结果交给分类验证：只做验证留痕，绝不写入正式 event_store。
+
+        返回分类实际收到的原日志与该版本自己的字段捕获，便于逐批核对。
+        """
+        capture = self.rule_registry.get_trial(version_id)
+        if capture is None:
+            raise RuleVersionError(f"版本 {version_id} 没有受控试跑记录")
+        self.rule_registry.mark_trial_delivered(version_id)
+        return [
+            {
+                "line_number": item.line_number,
+                "raw_line": item.raw_line,
+                "raw_checksum": item.raw_checksum,
+                "parse_status": item.parse_status.value,
+                "fields": dict(item.fields) if item.fields else None,
+                "field_names": list(item.field_names),
+            }
+            for item in capture.items
+        ]
+
+    def interrupt_pending_confirmation(self, version_id: str) -> None:
+        """版本登记确认未送回：标记进程中断，试跑维持非正式身份。"""
+        self.rule_registry.mark_trial_interrupted(version_id)
+
+    def claim_trial(self, version_id: str) -> TrialCapture | None:
+        """值班员认领新版试跑：已确认/已中断的试跑不再发放，非法版本无可领试跑。"""
+        capture = self.rule_registry.get_trial(version_id)
+        if capture is None or capture.confirmed or capture.interrupted:
+            return None
+        compilation = self.rule_registry.get_compilation(version_id)
+        if compilation is None or not compilation.valid:
+            return None
+        return capture
+
+    def recover_for_formal_classification(
+        self, entries: list[LogEntry]
+    ) -> list[LogEntry]:
+        """中断恢复：试跑条目不得当正式入库，未确认版本的条目不得重新解释。"""
+        recoverable: list[LogEntry] = []
+        for entry in entries:
+            if entry.is_trial:
+                continue
+            if not entry.rule_version:
+                continue
+            compilation = self.rule_registry.get_compilation(entry.rule_version)
+            if compilation is not None and compilation.state == VERSION_CONFIRMED:
+                recoverable.append(entry)
+        return recoverable
+
+    def promote_trial_version(
+        self, version_id: str, evidence_lines: list[str]
+    ):
+        """试跑转正式：逐行核对原行校验依据，原行被换过的试跑不能转正式。"""
+        return self.rule_registry.confirm_version(version_id, evidence_lines)
+
+    def get_batch_evidence(self, job_id: str, version_id: str) -> BatchEvidence | None:
+        """回溯某个正式批次实际读到的原日志与校验依据。"""
+        return self._batch_evidence.get(f"{job_id}:{version_id}")
+
 
     def get_event_store(self) -> dict[str, list[EventRecord]]:
         return self._event_store
